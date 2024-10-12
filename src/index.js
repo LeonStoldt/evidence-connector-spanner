@@ -1,115 +1,259 @@
-/**
- * This type describes the options that your connector expects to recieve
- * This could include username + password, host + port, etc
- * @typedef {Object} ConnectorOptions
- * @property {string} SomeOption
- */
+import gcp_spanner from "@google-cloud/spanner";
+const { Spanner, SpannerOptions } = gcp_spanner;
+import { OAuth2Client } from "google-auth-library";
+import { EvidenceType, TypeFidelity, asyncIterableToBatchedAsyncGenerator } from "@evidence-dev/db-commons";
 
-import { EvidenceType } from "@evidence-dev/db-commons";
 
 /**
  * @see https://docs.evidence.dev/plugins/create-source-plugin/#options-specification
- * @see https://github.com/evidence-dev/evidence/blob/main/packages/postgres/index.cjs#L316
  */
 export const options = {
-  SomeOption: {
-    title: "Some Option",
-    description:
-      "This object defines how SomeOption should be displayed and configured in the Settings UI",
-    type: "string", // options: 'string' | 'number' | 'boolean' | 'select' | 'file'
+  project_id: {
+    title: 'Project ID',
+    type: 'string',
+    secret: true,
+    required: true,
+    references: '$.keyfile.project_id',
+    forceReference: false
   },
+  location: {
+    title: 'Location (Region)',
+    type: 'string',
+    secret: false,
+    required: false,
+    default: 'US'
+  },
+  authenticator: { /* TODO: add emulator as option? */
+    title: 'Authentication Method',
+    type: 'select',
+    secret: false,
+    nest: false,
+    required: true,
+    default: 'service-account',
+    options: [
+      {
+        value: 'service-account',
+        label: 'Service Account'
+      },
+      {
+        value: 'gcloud-cli',
+        label: 'GCloud CLI'
+      },
+      {
+        value: 'oauth',
+        label: 'OAuth Access Token'
+      }
+    ],
+    children: {
+      'service-account': {
+        keyfile: {
+          title: 'Credentials File',
+          type: 'file',
+          fileFormat: 'json',
+          virtual: true
+        },
+        client_email: {
+          title: 'Client Email',
+          type: 'string',
+          secret: true,
+          required: true,
+          references: '$.keyfile.client_email',
+          forceReference: true
+        },
+        private_key: {
+          title: 'Private Key',
+          type: 'string',
+          secret: true,
+          required: true,
+          references: '$.keyfile.private_key',
+          forceReference: true
+        }
+      },
+      'gcloud-cli': {
+        /* no-op; only needs projectId */
+      },
+      oauth: {
+        token: {
+          type: 'string',
+          title: 'Token',
+          secret: true,
+          required: true
+        }
+      }
+    }
+  }
 };
 
+
 /**
- * Implementing this function creates a "file-based" connector
- *
- * Each file in the source directory will be passed to this function, and it will return
- * either an array, or an async generator {@see https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Statements/async_function*}
- * that contains the query results
- *
  * @see https://docs.evidence.dev/plugins/create-source-plugin/
- * @type {import("@evidence-dev/db-commons").GetRunner<ConnectorOptions>}
+ * @type {import("@evidence-dev/db-commons").GetRunner<SpannerOptions>}
  */
 export const getRunner = (options) => {
-  console.debug(`SomeOption = ${options.SomeOption}`);
-
-  // This function will be called for EVERY file in the sources directory
-  // If you are expecting a specific file type (e.g. SQL files), make sure to filter
-  // to exclude others.
-
-  // If you are using some local database file (e.g. a sqlite or duckdb file)
-  // You may also need to filter that file out as well
+  console.debug(`project_id = ${options.project_id}`);
+  console.debug(`project_id = ${options.authenticator}`);
   return async (queryText, queryPath) => {
-    // Note: add your logic to process each file queryText and/or queryPath here
-    // ...
-    
-    // Example output, delete or modify as needed
-    const output = {
-      rows: [
-        { someInt: 1, someString: "string" },
-        { someInt: 2, someString: "string2" },
-      ],
-      columnTypes: [
-        {
-          name: "someInt",
-          evidenceType: EvidenceType.NUMBER,
-          typeFidelity: "inferred",
-        },
-        {
-          name: "someString",
-          evidenceType: EvidenceType.STRING,
-          typeFidelity: "inferred",
-        },
-      ],
-      expectedRowCount: 2,
-    };
-
-    return output;
+    if (!queryPath.endsWith('.sql')) return null;
+    return runQuery(queryText, options);
   };
 };
 
-// Uncomment to use the advanced source interface
-// This uses the `yield` keyword, and returns the same type as getRunner, but with an added `name` and `content` field (content is used for caching)
-// sourceFiles provides an easy way to read the source directory to check for / iterate through files
-// /** @type {import("@evidence-dev/db-commons").ProcessSource<ConnectorOptions>} */
-// export async function* processSource(options, sourceFiles, utilFuncs) {
-//   yield {
-//     title: "some_demo_table",
-//     content: "SELECT * FROM some_demo_table", // This is ONLY used for caching
-//     rows: [], // rows can be an array
-//     columnTypes: [
-//       {
-//         name: "someInt",
-//         evidenceType: EvidenceType.NUMBER,
-//         typeFidelity: "inferred",
-//       },
-//     ],
-//   };
-//   yield {
-//     title: "some_demo_table",
-//     content: "SELECT * FROM some_demo_table", // This is ONLY used for caching
-//     rows: async function* () {}, // rows can be a generator function for returning batches of results (e.g. if an API is paginated, or database supports cursors)
-//     columnTypes: [
-//       {
-//         name: "someInt",
-//         evidenceType: EvidenceType.NUMBER,
-//         typeFidelity: "inferred",
-//       },
-//     ],
-//   };
 
-//  throw new Error("Process Source has not yet been implemented");
-// }
+/** @type {import("@evidence-dev/db-commons").RunQuery<SpannerOptions>} */
+export const runQuery = async (queryText, database, batchSize = 100000) => {
+  try {
+    const spanner = getConnection(database);
+    const instance = spanner.instance(database.instanceId);
+    const databaseConnection = instance.database(database.databaseId);
+    const [rows] = await databaseConnection.run({ sql: queryText });
+
+    const result = await asyncIterableToBatchedAsyncGenerator(rows, batchSize, {
+      standardizeRow
+    });
+
+    result.columnTypes = mapResultsToEvidenceColumnTypes(rows);
+    result.expectedRowCount = rows.length;
+
+    return result;
+  } catch (err) {
+    throw err.message;
+  }
+};
+
 
 /**
- * Implementing this function creates an "advanced" connector
- *
- *
- * @see https://docs.evidence.dev/plugins/create-source-plugin/
- * @type {import("@evidence-dev/db-commons").GetRunner<ConnectorOptions>}
+ * @param {SpannerOptions} db
+ * @returns {Spanner}
  */
+const getConnection = (credentials) => new Spanner({ ...getCredentials(credentials), maxRetries: 10 });
 
-/** @type {import("@evidence-dev/db-commons").ConnectionTester<ConnectorOptions>} */
+
+/**
+ * @param {Partial<SpannerOptions>} database
+ * @returns {SpannerOptions}
+ */
+const getCredentials = (database = {}) => {
+  const authentication_method = database.authenticator ?? 'service-account';
+
+  if (authentication_method === 'gcloud-cli') {
+    return {
+      projectId: database.project_id,
+      location: database.location
+    };
+  } else if (authentication_method === 'oauth') {
+    const access_token = database.token;
+    const oauth = new OAuth2Client();
+    oauth.setCredentials({ access_token });
+
+    return {
+      authClient: oauth,
+      projectId: database.project_id,
+      location: database.location
+    };
+  } else { /* service-account */
+    return {
+      projectId: database.project_id,
+      location: database.location,
+      credentials: {
+        client_email: database.client_email,
+        private_key: database.private_key?.replace(/\\n/g, '\n').trim()
+      }
+    };
+  }
+};
+
+
+/**
+ * Standardizes a row from a Spanner query
+ * @param {Record<string, unknown>} row
+ * @returns {Record<string, unknown>}
+ */
+const standardizeRow = (row) => {
+  const standardized = {};
+  for (const [key, value] of Object.entries(row)) {
+    if (typeof value === 'string' || typeof value === 'boolean' || typeof value === 'number') {
+      standardized[key] = value;
+    } else if (value instanceof Date) { /* SpannerDate extends Date */
+      standardized[key] = value.toISOString();
+    } else if (value instanceof Buffer) {
+      standardized[key] = value.toString('base64');
+    } else if (typeof value?.toFloat64 === 'function') {
+      standardized[key] = value.toFloat64();
+    }
+  }
+  return standardized;
+};
+
+
+/**
+ * @param {SpannerRow[]} results TODO: check if type is correct
+ * @returns {import('@evidence-dev/db-commons').ColumnDefinition[] | undefined}
+ */
+const mapResultsToEvidenceColumnTypes = (results) => {
+  return results?.map((field) => { /* TODO: check if results?.map is correct of if something like results?.schema?.fields?.map is needed */
+    /** @type {TypeFidelity} */
+    let typeFidelity = TypeFidelity.PRECISE;
+    let evidenceType = nativeTypeToEvidenceType(/** @type {string} */(field.type));
+    if (!evidenceType) {
+      typeFidelity = TypeFidelity.INFERRED;
+      evidenceType = EvidenceType.STRING;
+    }
+    return {
+      name: /** @type {string} */ (field.name),
+      evidenceType: evidenceType,
+      typeFidelity: typeFidelity
+    };
+  });
+};
+
+
+/**
+ * TODO: check if it's compatible with Spanner in PostgreSQL mode: https://cloud.google.com/spanner/docs/reference/postgresql/data-types
+ * TODO: currently duplicate with lib.js
+ * @see https://cloud.google.com/spanner/docs/reference/standard-sql/data-types
+ * @param {string} nativeFieldType
+ * @param {undefined} defaultType
+ * @returns {EvidenceType | undefined}
+ */
+const nativeTypeToEvidenceType = (nativeFieldType, defaultType = undefined) => {
+  switch (nativeFieldType) {
+    case 'BOOL':
+      return EvidenceType.BOOLEAN; /* add BOOLEAN? */
+    case 'INT64':
+    case 'FLOAT32':
+    case 'FLOAT64':
+    case 'NUMERIC':
+      return EvidenceType.NUMBER; /* add INT, SMALLINT, INTEGER, BIGINT, TINYINT, BYTEINT, DECIMAL, BIGDECIMAL, BIGNUMERIC, FLOAT? */
+    case 'STRING':
+    case 'BYTES':
+      return EvidenceType.STRING; /* add TIME, GEOGRAPHY, INTERVAL? */
+    case 'TIMESTAMP':
+    case 'DATE':
+      return EvidenceType.DATE; /* add DATETIME? */
+    case 'STRUCT':
+    case 'ARRAY':
+    case 'JSON':
+    default:
+      return defaultType;
+  }
+};
+
+
+/** @type {import("@evidence-dev/db-commons").ConnectionTester<SpannerOptions>} */
 export const testConnection = async (opts) => {
-  return true;
+  const spanner = getConnection(opts);
+  const instance = spanner.instance(opts.instanceId);
+  const database = instance.database(opts.databaseId);
+
+  return await database
+    .run({ sql: 'SELECT 1' })
+    .then(() => true)
+    .catch((e) => {
+      if (e instanceof Error) return { reason: e.message };
+			try {
+				return { reason: JSON.stringify(e) };
+			} catch {
+				return { reason: 'Unknown Connection Error' };
+			}
+    })
 };
