@@ -1,3 +1,5 @@
 node_modules
-test-app
 plugin-template
+demo
+spanner-emulator
+.envrc

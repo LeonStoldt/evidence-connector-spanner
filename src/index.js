@@ -16,6 +16,18 @@ export const options = {
     references: '$.keyfile.project_id',
     forceReference: false
   },
+  instance_id: {
+    title: 'Spanner Instance Id',
+    type: 'string',
+    secret: false,
+    required: true
+  },
+  database_id: {
+    title: 'Spanner Database Id',
+    type: 'string',
+    secret: false,
+    required: true
+  },
   location: {
     title: 'Location (Region)',
     type: 'string',
@@ -23,7 +35,7 @@ export const options = {
     required: false,
     default: 'US'
   },
-  authenticator: { /* TODO: add emulator as option? */
+  authenticator: {
     title: 'Authentication Method',
     type: 'select',
     secret: false,
@@ -42,9 +54,13 @@ export const options = {
       {
         value: 'oauth',
         label: 'OAuth Access Token'
+      },
+      {
+        value: 'emulator',
+        label: 'Emulator'
       }
     ],
-    children: {
+    children: { /* TODO: Add description for parameters */
       'service-account': {
         keyfile: {
           title: 'Credentials File',
@@ -79,6 +95,22 @@ export const options = {
           secret: true,
           required: true
         }
+      },
+      emulator: {
+        emulator_host: {
+          type: 'string',
+          title: 'Host',
+          description: 'Hostname of running Cloud Spanner Emulator, without the port. (e.g. localhost)',
+          default: 'localhost',
+          required: true
+        },
+        emulator_port: {
+          type: 'string',
+          title: 'Port',
+          description: 'HTTP Port of running Cloud Spanner Emulator. (e.g. 9020)',
+          default: '9020',
+          required: true
+        }
       }
     }
   }
@@ -90,8 +122,6 @@ export const options = {
  * @type {import("@evidence-dev/db-commons").GetRunner<SpannerOptions>}
  */
 export const getRunner = (options) => {
-  console.debug(`project_id = ${options.project_id}`);
-  console.debug(`project_id = ${options.authenticator}`);
   return async (queryText, queryPath) => {
     if (!queryPath.endsWith('.sql')) return null;
     return runQuery(queryText, options);
@@ -103,14 +133,13 @@ export const getRunner = (options) => {
 export const runQuery = async (queryText, database, batchSize = 100000) => {
   try {
     const spanner = getConnection(database);
-    const instance = spanner.instance(database.instanceId);
-    const databaseConnection = instance.database(database.databaseId);
+    const instance = spanner.instance(database.instance_id);
+    const databaseConnection = instance.database(database.database_id);
     const [rows] = await databaseConnection.run({ sql: queryText });
-
+    console.log(rows)
     const result = await asyncIterableToBatchedAsyncGenerator(rows, batchSize, {
       standardizeRow
     });
-
     result.columnTypes = mapResultsToEvidenceColumnTypes(rows);
     result.expectedRowCount = rows.length;
 
@@ -150,6 +179,12 @@ const getCredentials = (database = {}) => {
       projectId: database.project_id,
       location: database.location
     };
+  } else if (authentication_method === 'emulator') {
+      return {
+        projectId: database.project_id,
+        apiEndpoint: database.emulator_host,
+        port: database.emulator_port
+      }
   } else { /* service-account */
     return {
       projectId: database.project_id,
@@ -170,10 +205,11 @@ const getCredentials = (database = {}) => {
  */
 const standardizeRow = (row) => {
   const standardized = {};
+  console.log(Object.entries(row))
   for (const [key, value] of Object.entries(row)) {
     if (typeof value === 'string' || typeof value === 'boolean' || typeof value === 'number') {
       standardized[key] = value;
-    } else if (value instanceof Date) { /* SpannerDate extends Date */
+    } else if (value instanceof Date) {
       standardized[key] = value.toISOString();
     } else if (value instanceof Buffer) {
       standardized[key] = value.toString('base64');
@@ -181,25 +217,51 @@ const standardizeRow = (row) => {
       standardized[key] = value.toFloat64();
     }
   }
+  console.log(standardized)
   return standardized;
 };
 
 
 /**
- * @param {SpannerRow[]} results TODO: check if type is correct
+ * @param {Record<string, unknown>[]} results
  * @returns {import('@evidence-dev/db-commons').ColumnDefinition[] | undefined}
  */
 const mapResultsToEvidenceColumnTypes = (results) => {
-  return results?.map((field) => { /* TODO: check if results?.map is correct of if something like results?.schema?.fields?.map is needed */
+  if (!results || results.length === 0) return [];
+
+  // Use the first row to extract column names and infer types
+  const firstRow = results[0];
+  return firstRow.map((column) => {
+    const { name, value } = column;
     /** @type {TypeFidelity} */
-    let typeFidelity = TypeFidelity.PRECISE;
-    let evidenceType = nativeTypeToEvidenceType(/** @type {string} */(field.type));
+    let typeFidelity = TypeFidelity.INFERRED;
+    let evidenceType;
+
+    // Try to infer type from the value
+    if (typeof value === 'string') {
+      evidenceType = EvidenceType.STRING;
+      typeFidelity = TypeFidelity.PRECISE;
+    } else if (typeof value === 'number') {
+      evidenceType = EvidenceType.NUMBER;
+      typeFidelity = TypeFidelity.PRECISE;
+    } else if (typeof value === 'boolean') {
+      evidenceType = EvidenceType.BOOLEAN;
+      typeFidelity = TypeFidelity.PRECISE;
+    } else if (value instanceof Date) {
+      evidenceType = EvidenceType.DATE;
+      typeFidelity = TypeFidelity.PRECISE;
+    } else if (value instanceof Object) {
+      typeFidelity = TypeFidelity.PRECISE;
+      evidenceType = nativeTypeToEvidenceType(/** @type {string} */(value.constructor.name));
+    }
+    
     if (!evidenceType) {
       typeFidelity = TypeFidelity.INFERRED;
       evidenceType = EvidenceType.STRING;
     }
+
     return {
-      name: /** @type {string} */ (field.name),
+      name: /** @type {string} */ (name),
       evidenceType: evidenceType,
       typeFidelity: typeFidelity
     };
@@ -209,30 +271,25 @@ const mapResultsToEvidenceColumnTypes = (results) => {
 
 /**
  * TODO: check if it's compatible with Spanner in PostgreSQL mode: https://cloud.google.com/spanner/docs/reference/postgresql/data-types
- * TODO: currently duplicate with lib.js
+ * 
+ * These types returned by spanner do not exactly match Spanner Data Types
  * @see https://cloud.google.com/spanner/docs/reference/standard-sql/data-types
+ * 
+ * e.g. INT64 database column returns 'Int { value: '42' }' as object.
+ * 
  * @param {string} nativeFieldType
  * @param {undefined} defaultType
  * @returns {EvidenceType | undefined}
  */
 const nativeTypeToEvidenceType = (nativeFieldType, defaultType = undefined) => {
   switch (nativeFieldType) {
-    case 'BOOL':
-      return EvidenceType.BOOLEAN; /* add BOOLEAN? */
-    case 'INT64':
-    case 'FLOAT32':
-    case 'FLOAT64':
-    case 'NUMERIC':
-      return EvidenceType.NUMBER; /* add INT, SMALLINT, INTEGER, BIGINT, TINYINT, BYTEINT, DECIMAL, BIGDECIMAL, BIGNUMERIC, FLOAT? */
-    case 'STRING':
-    case 'BYTES':
-      return EvidenceType.STRING; /* add TIME, GEOGRAPHY, INTERVAL? */
-    case 'TIMESTAMP':
-    case 'DATE':
-      return EvidenceType.DATE; /* add DATETIME? */
-    case 'STRUCT':
-    case 'ARRAY':
-    case 'JSON':
+    case 'Int':
+    case 'Float32':
+    case 'Float':
+    case 'Numeric':
+      return EvidenceType.NUMBER;
+    case 'Buffer':
+      return EvidenceType.STRING;
     default:
       return defaultType;
   }
@@ -242,9 +299,9 @@ const nativeTypeToEvidenceType = (nativeFieldType, defaultType = undefined) => {
 /** @type {import("@evidence-dev/db-commons").ConnectionTester<SpannerOptions>} */
 export const testConnection = async (opts) => {
   const spanner = getConnection(opts);
-  const instance = spanner.instance(opts.instanceId);
-  const database = instance.database(opts.databaseId);
-
+  const instance = spanner.instance(opts.instance_id);
+  const database = instance.database(opts.database_id);
+  
   return await database
     .run({ sql: 'SELECT 1' })
     .then(() => true)
